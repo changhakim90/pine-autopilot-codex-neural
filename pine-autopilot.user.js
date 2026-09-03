@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Pine Autopilot — Joe Learning Loop
 // @namespace    https://pineandco.online/
-// @version      12.0.0
+// @version      12.1.0
 // @description  Local-only neural-network Joe player for Pine & Co Cocktail Defense.
 // @match        https://pineandco.online/*
 // @homepageURL  https://github.com/changhakim90/pine-autopilot-codex-neural
@@ -24,9 +24,10 @@
   if (window.__pineAutopilotLoaded) return;
   window.__pineAutopilotLoaded = true;
 
-  const VERSION = '12.0.0';
-  // v12 retains v11's durable transfer path and captures manual key presses
-  // immediately, including short taps that an interval sampler can miss.
+  const VERSION = '12.1.0';
+  // v12.1 retains v11's durable transfer path and captures manual key presses
+  // immediately, including short taps that an interval sampler can miss. It
+  // also applies the supplied survival card doctrine before neural ranking.
   const STORE = 'pine-autopilot:joe:neural:v12';
   const LEGACY_STORE = 'pine-autopilot:joe:neural:v11';
   const CHANNEL = 'pine-autopilot:neural:v12';
@@ -57,6 +58,11 @@
   const DEMONSTRATION_LIMIT = 500;
   const TARGET_SYNC = 1500;
   const CARD_CREDIT_SECONDS = 18;
+  // Domain constraints are intentionally separate from learned Q-values. A
+  // model may rank among legal cards, but it may never explore into Rainbow
+  // Gun. The rest are modest, durable survival priors rather than a brittle
+  // hand-written card sequence.
+  const RAINBOW_GUN_RE = /\bRAINBOW\s*GUN\b|\bGUN\s*RAINBOW\b/i;
   // A policy action that spans a larger observed game-time jump is ambiguous:
   // it may contain several unseen collisions. Keep it out of replay.
   const MAX_QUALITY_TIME_JUMP = 1.75;
@@ -238,7 +244,7 @@
     const midHead = createHead(earlyHead);
     const lateHead = createHead(midHead);
     return {
-      version: 12,
+      version: 12.1,
       completedRuns: 0,
       bestSeconds: 0,
       totalSeconds: 0,
@@ -307,7 +313,7 @@
       return {
         ...fresh,
         ...saved,
-        version: 12,
+        version: 12.1,
         migratedFromV8: !!saved.migratedFromV8,
         movementNet: validNetwork(saved.movementNet, MOVE_INPUTS, ACTIONS.length) ? saved.movementNet : fresh.movementNet,
         cardNet: validNetwork(saved.cardNet, CARD_INPUTS, 1) ? saved.cardNet : fresh.cardNet,
@@ -908,6 +914,20 @@
     return 0;
   }
 
+  let lastBossProbeAt = 0;
+  let latestBossActive = false;
+
+  function visibleBossState(hudText) {
+    // Prefer the visible HUD, then tolerate future markup that exposes a
+    // boss bar. The canvas is intentionally never reverse-engineered.
+    if (Date.now() - lastBossProbeAt < 180) return latestBossActive;
+    lastBossProbeAt = Date.now();
+    const visibleBossNode = [...document.querySelectorAll('#bossBar, #bossHud, [data-boss], [id*="boss" i], [class*="boss" i]')]
+      .some((node) => visible(node));
+    latestBossActive = /\bBOSS\b/i.test(hudText || '') || visibleBossNode;
+    return latestBossActive;
+  }
+
   let lastVisionAt = 0;
   let latestVision = Array(27).fill(0);
   let visionHistory = Array.from({ length: VISION_HISTORY }, () => Array(27).fill(0));
@@ -1013,6 +1033,7 @@
       time,
       downs,
       level,
+      bossActive: visibleBossState(hudText),
       choosing: visible(levelScreen),
       crafting,
       notices,
@@ -1795,6 +1816,12 @@
     const threat = currentThreatBins(observation);
     const pressure = threat.reduce((sum, item) => sum + item, 0);
     if (health < 0.35 || threat[4] > 0.12) return 'escape';
+    // Attacks are game-driven, so the bot does not need a fake aim system.
+    // When a visible boss marker is present it instead keeps a combat-safe
+    // weave and spends available clear tools rather than retreating and
+    // sacrificing the boss loot/tip opportunity.
+    if (observation.bossActive && observation.ultimateReady) return 'boss-clear';
+    if (observation.bossActive && health > 0.48) return 'boss-engage';
     if (observation.ultimateReady && pressure > 0.35) return 'clear';
     // Object features contain the yellow-cluster position/mass. This only
     // nudges exploration; the value network still makes the final decision.
@@ -1804,6 +1831,10 @@
 
   function intentBonus(intent, pattern, observation) {
     if (intent === 'escape') return (/orbit|perimeter/.test(pattern.id) ? 0.035 : 0) + (pattern.dash && observation.dashReady ? 0.025 : 0);
+    if (intent === 'boss-clear') return (pattern.ultimate && observation.ultimateReady ? 0.09 : 0)
+      + (/weave|horizontal|vertical/.test(pattern.id) ? 0.018 : 0);
+    if (intent === 'boss-engage') return (/weave|horizontal|vertical/.test(pattern.id) ? 0.032 : 0)
+      + (pattern.ultimate && observation.ultimateReady ? 0.045 : 0);
     if (intent === 'clear') return pattern.ultimate && observation.ultimateReady ? 0.045 : 0;
     if (intent === 'collect' && !pattern.ultimate) return 0.012;
     return 0;
@@ -1868,17 +1899,75 @@
     return value;
   }
 
+  function isRainbowGunCard(text) {
+    return RAINBOW_GUN_RE.test(String(text || ''));
+  }
+
+  function isUpgradeCard(label) {
+    return /\bLV\.?\s*\d+\s*(?:→|->|>)|\bUPGRADE\b|\bEVOLVE\b|\bLEVEL\s*\d+/i.test(label);
+  }
+
+  function cardSurvivalPrior(text, observation) {
+    const label = String(text || '').toUpperCase();
+    if (isRainbowGunCard(label)) return { forbidden: true, value: -Infinity };
+
+    const phase = phaseFor(observation);
+    const late = phase === 'late' || phase === 'hell';
+    const midOrLater = phase === 'mid' || late;
+    const lowHealth = observation.health !== null && observation.health < 0.55;
+    const damageWeapon = /\bMOJITO\b|\bVODKA\s*TONIC\b|\bGIN\s*TONIC\b|\bSOUTHSIDE\b/.test(label);
+    const ultimateSupport = /\bULTIMATE\b|\bSHAKING\s*UP\b/.test(label);
+    const olive = /\bOLIVE(?:S)?\b/.test(label);
+    const blackVermouth = /\bBLACK\s*VERMOUTH\b/.test(label);
+    const vermouth = /\b(?:SWEET|DRY)\s*VERMOUTH\b/.test(label);
+    const defense = /\bNEGRONI\b|\bDODGE\b|\bSHIELD\b|\bMAX\s*HP\b|\bHEALTH\b|\bDEFEN[CS]E\b/.test(label);
+    const sustain = /\bSUGAR\b|\bWATER\b|\bITEM\s*LUCK\b|\bLUCK\b|\bREGEN\b/.test(label);
+    const bossUtility = /\bFLAME\s*CROSS\b|\bTEQUILA\s*SHOTS?\b|\bTIME\s*STOP(?:S)?\b/.test(label);
+    const upgrade = isUpgradeCard(label);
+    const newCard = /NEW\s*[·.]?\s*LV\s*1/.test(label);
+    let value = 0;
+
+    // Early damage lets Joe remove threats before they become a survival
+    // problem; defense and sustain protect the run while the build develops.
+    if (damageWeapon) value += late ? 0.56 : 0.82;
+    if (ultimateSupport) value += midOrLater ? 0.78 : 0.58;
+    if (olive) value += lowHealth ? 0.88 : 0.53;
+    if (blackVermouth) value += 1.05; // consolidates the vermouth build.
+    else if (vermouth) value += late ? 0.43 : 0.58;
+    if (defense) value += lowHealth ? 0.90 : 0.54;
+    if (sustain) value += late ? 0.22 : 0.43;
+
+    // Boss utility is most valuable once the core build is in place. During a
+    // visible boss fight, retain a stronger preference for its clear tools.
+    if (bossUtility) value += midOrLater ? 0.76 : 0.34;
+    if (observation.bossActive && (damageWeapon || ultimateSupport || bossUtility)) value += 0.30;
+
+    // In Late/Hell, use slots to complete the existing ingredients and
+    // weapons. New off-plan economy items are deliberately less attractive.
+    if (late && upgrade) value += 0.72;
+    if (late && newCard && !damageWeapon && !ultimateSupport && !defense && !sustain && !bossUtility && !vermouth) value -= 0.38;
+    if (late && /\bGOLD\b|\bCASH\b|\bMONEY\b/.test(label) && !sustain) value -= 0.32;
+    return { forbidden: false, value };
+  }
+
   function chooseCard(observation) {
     const cards = [...document.querySelectorAll('#upRow .up-card')].filter(visible);
     if (!cards.length || Date.now() - run.lastFlowAt < FLOW_GAP_MS) return false;
     const head = actingHeadFor(observation);
     const exploring = Math.random() < actingExplorationRate(head);
     const slate = cardSlateFeatures(cards);
-    let choice = null;
-    cards.forEach((element, index) => {
+    const candidates = cards.map((element) => {
       const text = element.innerText || '';
+      return { element, text, prior: cardSurvivalPrior(text, observation) };
+    }).filter((candidate) => !candidate.prior.forbidden);
+    if (!candidates.length) {
+      run.status = 'Rainbow Gun was the only visible upgrade; holding the hard ban.';
+      return false;
+    }
+    let choice = null;
+    candidates.forEach(({ element, text, prior }, index) => {
       const prediction = networkForward(head.cardNet, cardInput(observation, text, slate)).output[0];
-      const score = prediction + (head.cardNet.samples < 80 ? cardWarmStart(text, observation) : 0);
+      const score = prediction + prior.value + (head.cardNet.samples < 80 ? cardWarmStart(text, observation) : 0);
       if (!choice || score > choice.score || (exploring && Math.random() < 1 / (index + 1))) choice = { element, text, score };
     });
     if (!choice) return false;
@@ -2765,7 +2854,7 @@
       : `\nTournament: candidate ${cleanEvaluations.length}/${TOURNAMENT_WINDOW} · champion ${championEvaluations.length}/${TOURNAMENT_WINDOW} clean evals`;
     const migrationText = model.migratedFromV8 ? '\nImported earlier challenger and champion' : '';
     const timingText = run.timingWarnings ? `\nTiming: ${run.largestGameTimeJump.toFixed(1)} s max jump · ${run.timingWarnings} warning(s) · ${run.lowQualityDropped} transition(s) dropped` : '';
-    const top = `Role: ${learnerRole()} · ${workerProfile} worker\nDQN gradient steps: ${experienceCount()}\nUnique shared experiences: ${model.uniqueExperiences}\nEarly ε: ${(explorationRate(model) * 100).toFixed(1)}% · Mid: ${(explorationRate(model.midHead) * 100).toFixed(1)}%\nLate ε: ${(explorationRate(model.lateHead) * 100).toFixed(1)}% · Hell: ${(explorationRate(model.hellHead) * 100).toFixed(1)}%\nReplay: ${model.replay.length}/${REPLAY_LIMIT} · elite: ${model.eliteCount || model.elite.length}/${ELITE_LIMIT} · demos: ${model.demonstrationCount || model.demonstrations.length}/${DEMONSTRATION_LIMIT}\nImmortal policy: ${model.settings.immortalMode ? 'protected' : 'off'} · ${Object.keys(model.masteryPolicy).length} learned situations · used ${model.masteryActionUses} times\nDurable transfers: manual ${model.manualTransfersAccepted} · elite ${model.eliteTransfersAccepted}\nReplay phase mix: E${replayPhaseCounts.early} M${replayPhaseCounts.mid} L${replayPhaseCounts.late} H${replayPhaseCounts.hell}\nAdaptive replay: ${adaptiveReplayBatch}/transition · ${Math.round(DEMONSTRATION_REPLAY_RATE * 100)}% demo target · imitate ${model.eliteImitationSteps}\nRisk shield: ${Object.keys(model.riskStats).length} learned states · ${model.riskUpdates} outcomes\nIdle consolidation: ${model.consolidationSteps} updates / ${model.consolidationPasses} passes\nIntent: ${run.intent} · shield: colour-threat aware\nCandidate held-out: ${cleanEvaluations.length ? formatTime(evaluationMedian) : 'collecting…'} (${cleanEvaluations.length} accepted / ${model.evaluationResults.length} total; ≤${(MAX_EVALUATION_DROPPED_RATE * 100).toFixed(0)}% drops)${tournamentText}${trendText}${championText}${migrationText}${timingText}`;
+    const top = `Role: ${learnerRole()} · ${workerProfile} worker\nDQN gradient steps: ${experienceCount()}\nUnique shared experiences: ${model.uniqueExperiences}\nEarly ε: ${(explorationRate(model) * 100).toFixed(1)}% · Mid: ${(explorationRate(model.midHead) * 100).toFixed(1)}%\nLate ε: ${(explorationRate(model.lateHead) * 100).toFixed(1)}% · Hell: ${(explorationRate(model.hellHead) * 100).toFixed(1)}%\nReplay: ${model.replay.length}/${REPLAY_LIMIT} · elite: ${model.eliteCount || model.elite.length}/${ELITE_LIMIT} · demos: ${model.demonstrationCount || model.demonstrations.length}/${DEMONSTRATION_LIMIT}\nCard doctrine: Rainbow Gun hard-banned · survival upgrades · boss clear\nImmortal policy: ${model.settings.immortalMode ? 'protected' : 'off'} · ${Object.keys(model.masteryPolicy).length} learned situations · used ${model.masteryActionUses} times\nDurable transfers: manual ${model.manualTransfersAccepted} · elite ${model.eliteTransfersAccepted}\nReplay phase mix: E${replayPhaseCounts.early} M${replayPhaseCounts.mid} L${replayPhaseCounts.late} H${replayPhaseCounts.hell}\nAdaptive replay: ${adaptiveReplayBatch}/transition · ${Math.round(DEMONSTRATION_REPLAY_RATE * 100)}% demo target · imitate ${model.eliteImitationSteps}\nRisk shield: ${Object.keys(model.riskStats).length} learned states · ${model.riskUpdates} outcomes\nIdle consolidation: ${model.consolidationSteps} updates / ${model.consolidationPasses} passes\nIntent: ${run.intent} · shield: colour-threat aware\nCandidate held-out: ${cleanEvaluations.length ? formatTime(evaluationMedian) : 'collecting…'} (${cleanEvaluations.length} accepted / ${model.evaluationResults.length} total; ≤${(MAX_EVALUATION_DROPPED_RATE * 100).toFixed(0)}% drops)${tournamentText}${trendText}${championText}${migrationText}${timingText}`;
     const learning = panel.querySelector('#learning');
     learning.textContent = top;
     learning.style.whiteSpace = 'pre-line';
