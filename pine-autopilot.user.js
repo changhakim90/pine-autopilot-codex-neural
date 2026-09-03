@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Pine Autopilot — Joe Learning Loop
 // @namespace    https://pineandco.online/
-// @version      12.2.0
+// @version      12.3.0
 // @description  Local-only neural-network Joe player for Pine & Co Cocktail Defense.
 // @match        https://pineandco.online/*
 // @homepageURL  https://github.com/changhakim90/pine-autopilot-codex-neural
@@ -24,8 +24,8 @@
   if (window.__pineAutopilotLoaded) return;
   window.__pineAutopilotLoaded = true;
 
-  const VERSION = '12.2.0';
-  // v12.2 turns the supplied build knowledge into observable reinforcement:
+  const VERSION = '12.3.0';
+  // v12.3 turns the supplied build knowledge into observable reinforcement:
   // card and movement choices are rewarded only after they produce survival,
   // kills, money, and tip upgrades in the live game.
   const STORE = 'pine-autopilot:joe:neural:v12';
@@ -192,6 +192,7 @@
     episodeTransitions: [],
     evaluation: false,
     evaluationPolicy: 'candidate',
+    build: { water: false, sugar: false, sodaWater: false },
     pressed: new Set(),
     lastCard: null,
     lastCardAt: 0,
@@ -242,7 +243,7 @@
     const midHead = createHead(earlyHead);
     const lateHead = createHead(midHead);
     return {
-      version: 12.2,
+      version: 12.3,
       completedRuns: 0,
       bestSeconds: 0,
       totalSeconds: 0,
@@ -302,16 +303,39 @@
     };
   }
 
+  function resetWaterCardFeatureWeights(head) {
+    if (!head) return;
+    [head.cardNet, head.cardTarget].forEach((network) => {
+      if (!validNetwork(network, CARD_INPUTS, 1)) return;
+      // The old BASE and constant columns become Water/Soda Water. Clear only
+      // those two input columns so existing card and movement learning stays.
+      for (let hidden = 0; hidden < network.hidden; hidden += 1) {
+        network.w1[hidden * network.inputs + STATE_INPUTS + 6] = 0;
+        network.w1[hidden * network.inputs + STATE_INPUTS + 7] = 0;
+      }
+    });
+  }
+
+  function migrateWaterCardFeatures(restored, sourceVersion) {
+    if (sourceVersion >= 12.3) return;
+    [restored, restored.midHead, restored.lateHead, restored.hellHead].forEach(resetWaterCardFeatureWeights);
+    if (restored.champion) {
+      [restored.champion.earlyHead, restored.champion.midHead, restored.champion.lateHead, restored.champion.hellHead]
+        .forEach(resetWaterCardFeatureWeights);
+    }
+  }
+
   function loadModel() {
     try {
       const v12Stored = localStorage.getItem(STORE);
       const saved = unpackStoredModel(JSON.parse(v12Stored || localStorage.getItem(LEGACY_STORE) || 'null'));
       const fresh = blankModel();
       if (!saved || typeof saved !== 'object') return fresh;
-      return {
+      const sourceVersion = Number(saved.version) || 0;
+      const restored = {
         ...fresh,
         ...saved,
-        version: 12.2,
+        version: 12.3,
         migratedFromV8: !!saved.migratedFromV8,
         movementNet: validNetwork(saved.movementNet, MOVE_INPUTS, ACTIONS.length) ? saved.movementNet : fresh.movementNet,
         cardNet: validNetwork(saved.cardNet, CARD_INPUTS, 1) ? saved.cardNet : fresh.cardNet,
@@ -347,6 +371,8 @@
         consolidationPasses: Number(saved.consolidationPasses) || 0,
         events: Array.isArray(saved.events) ? saved.events.slice(-60) : [],
       };
+      migrateWaterCardFeatures(restored, sourceVersion);
+      return restored;
     } catch (_) {
       return blankModel();
     }
@@ -1485,23 +1511,48 @@
       fraction(/MOJITO|VODKA\s*TONIC|GIN\s*TONIC|SOUTHSIDE|ULTIMATE|SHAKING\s*UP|FLAME\s*CROSS|TEQUILA\s*SHOTS?|TIME\s*STOP|ATTACK|POWER|RAPID|DAMAGE|FIRE/),
       fraction(/OLIVE|VERMOUTH|NEGRONI|DODGE|SHIELD|MAX HP|HEALTH|DEFEN[CS]E|REGEN/),
       fraction(/MOVE|SPEED|DASH|MINT/),
-      fraction(/GOLD|CASH|MONEY|LUCK|SUGAR|WATER|REGEN/),
+      fraction(/GOLD|CASH|MONEY|LUCK|SUGAR|REGEN/),
       clip(labels.length / 5, 0, 1),
     ];
+  }
+
+  function waterCardKind(text) {
+    const label = String(text || '').toUpperCase();
+    const sodaWater = /\bSODA\s+WATER\b/.test(label);
+    return {
+      water: !sodaWater && /\bWATER\b/.test(label),
+      sodaWater,
+      simpleSyrup: /\bSIMPLE\s+SYRUP\b/.test(label),
+    };
+  }
+
+  function rememberBuildCard(text) {
+    const label = String(text || '').toUpperCase();
+    const kind = waterCardKind(label);
+    if (kind.water) run.build.water = true;
+    if (kind.sodaWater) run.build.sodaWater = true;
+    if (/\bSUGAR\b/.test(label)) run.build.sugar = true;
   }
 
   function cardInput(observation, text, slate) {
     const label = String(text).toUpperCase();
     const isNew = /NEW\s*[·.]?\s*LV\s*1/.test(label) ? 1 : 0;
+    const water = waterCardKind(label);
+    const sugar = /\bSUGAR\b/.test(label);
+    const generalSupport = /GOLD|CASH|MONEY|LUCK|REGEN/.test(label) ? 1 : 0;
+    // The network sees whether this exact candidate completes Water + Sugar,
+    // while Soda Water remains a distinct card feature for phase-based value.
+    const sugarValue = sugar ? (run.build.water ? 1 : 0.55) : 0;
+    const waterValue = water.water ? (run.build.sugar ? 1 : 0.55) : water.simpleSyrup ? 1 : 0;
     return stateFeatures(observation).concat([
       /EVOLVE|SUPER|RAINBOW/.test(label) ? 1 : 0,
       /MOJITO|VODKA\s*TONIC|GIN\s*TONIC|SOUTHSIDE|ULTIMATE|SHAKING\s*UP|FLAME\s*CROSS|TEQUILA\s*SHOTS?|TIME\s*STOP|WHISKY SOUR|NEGRONI|MARTINI|MANHATTAN|OLD FASHIONED|ATTACK|POWER|RAPID|DAMAGE|FIRE/.test(label) ? 1 : 0,
       /OLIVE|VERMOUTH|NEGRONI|DODGE|SHIELD|MAX HP|HEALTH|DEFEN[CS]E|REGEN/.test(label) ? 1 : 0,
       /MOVE|SPEED|DASH|MINT/.test(label) ? 1 : 0,
       isNew,
-      /GOLD|CASH|MONEY|LUCK|SUGAR|WATER|REGEN/.test(label) ? 1 : 0,
-      /BASE/.test(label) ? 1 : 0,
-      1,
+      Math.max(generalSupport, sugarValue),
+      waterValue,
+      water.sodaWater ? 1 : 0,
     ]).concat(slate || Array(6).fill(0));
   }
 
@@ -1911,7 +1962,8 @@
       if (!choice || score > choice.score || (exploring && Math.random() < 1 / (index + 1))) choice = { element, text, score };
     });
     if (!choice) return false;
-    click(choice.element, `Card: ${cardKey(choice.text).slice(0, 34)}`);
+    if (!click(choice.element, `Card: ${cardKey(choice.text).slice(0, 34)}`)) return false;
+    rememberBuildCard(choice.text);
     run.lastCard = {
       input: cardInput(observation, choice.text, slate),
       chosenAtGameTime: observation.time,
@@ -2294,6 +2346,7 @@
     run.episodeTransitions = [];
     run.evaluation = false;
     run.evaluationPolicy = 'candidate';
+    run.build = { water: false, sugar: false, sodaWater: false };
     run.hellMode = false;
     run.maxPhase = 'early';
   }
@@ -2408,6 +2461,7 @@
   function play(observation) {
     if (!run.gameStartedAt) {
       run.gameStartedAt = Date.now() - observation.time * 1000;
+      run.build = { water: false, sugar: false, sodaWater: false };
       run.evaluation = (model.completedRuns + 1) % EVALUATION_INTERVAL_RUNS === 0;
       const evaluationNumber = Math.floor((model.completedRuns + 1) / EVALUATION_INTERVAL_RUNS);
       run.evaluationPolicy = run.evaluation && model.champion
