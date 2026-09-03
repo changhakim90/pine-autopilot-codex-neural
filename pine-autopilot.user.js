@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Pine Autopilot — Joe Learning Loop
 // @namespace    https://pineandco.online/
-// @version      9.0.0
+// @version      10.0.0
 // @description  Local-only neural-network Joe player for Pine & Co Cocktail Defense.
 // @match        https://pineandco.online/*
 // @homepageURL  https://github.com/changhakim90/pine-autopilot-codex-neural
@@ -24,12 +24,12 @@
   if (window.__pineAutopilotLoaded) return;
   window.__pineAutopilotLoaded = true;
 
-  const VERSION = '9.0.0';
-  // v9 keeps v8's network shape but adds learned risk estimates and bounded
-  // browser-side replay consolidation. First launch imports v8 unchanged.
-  const STORE = 'pine-autopilot:joe:neural:v9';
-  const LEGACY_STORE = 'pine-autopilot:joe:neural:v8';
-  const CHANNEL = 'pine-autopilot:neural:v9';
+  const VERSION = '10.0.0';
+  // v10 preserves v9's neural weights and turns player demonstrations into a
+  // compact, protected action prior. Ordinary exploration cannot overwrite it.
+  const STORE = 'pine-autopilot:joe:neural:v10';
+  const LEGACY_STORE = 'pine-autopilot:joe:neural:v9';
+  const CHANNEL = 'pine-autopilot:neural:v10';
   // At 100× game speed, a 55 ms wall-clock poll skips several game seconds.
   // Ten ms keeps the 1.2-second policy horizon meaningful while the page is
   // active, without asking the game for more animation frames.
@@ -72,6 +72,12 @@
   const ROLLBACK_COOLDOWN_MS = 5 * 60 * 1000;
   const ELITE_IMITATION_MARGIN = 0.28;
   const ELITE_IMITATION_WEIGHT = 0.32;
+  const DEMONSTRATION_REPLAY_RATE = 0.34;
+  const MASTERY_STATS_LIMIT = 1800;
+  const MASTERY_MIN_VISITS = 3;
+  const MASTERY_MAX_BONUS = 0.82;
+  const MANUAL_VIDEO_FPS = 12;
+  const MANUAL_VIDEO_BITS_PER_SECOND = 1800000;
   const RISK_MIN_SAMPLES = 8;
   const RISK_STATS_LIMIT = 1800;
   const IDLE_CONSOLIDATION_MAX_STEPS = 28;
@@ -100,6 +106,9 @@
   ];
 
   const model = loadModel();
+  // v9 demonstrations become the v10 protected policy on first load. The
+  // compact policy survives after the raw 500-sample demo window rotates.
+  if (!Object.keys(model.masteryPolicy || {}).length && model.demonstrations.length) rebuildMasteryFromDemonstrations();
   let adaptiveReplayBatch = REPLAY_BATCH;
   const priorityTree = new Float64Array(REPLAY_LIMIT * 2);
   let replayPeakPriority = 1;
@@ -192,6 +201,9 @@
     chunks: [],
     stream: null,
     startedAt: 0,
+    keyDownAt: {},
+    burstActionIndex: -1,
+    burstUntil: 0,
   };
 
   const panel = mountPanel();
@@ -219,7 +231,7 @@
     const midHead = createHead(earlyHead);
     const lateHead = createHead(midHead);
     return {
-      version: 9,
+      version: 10,
       completedRuns: 0,
       bestSeconds: 0,
       totalSeconds: 0,
@@ -233,7 +245,7 @@
       localExperiences: 0,
       peerExperiences: 0,
       uniqueExperiences: 0,
-      settings: { safetyRestartAt60: true, panelMinimized: false },
+      settings: { safetyRestartAt60: true, panelMinimized: false, immortalMode: true },
       replay: [],
       replayCursor: 0,
       elite: [],
@@ -241,6 +253,9 @@
       eliteScores: [],
       demonstrations: [],
       demonstrationCount: 0,
+      masteryPolicy: {},
+      masteryUpdates: 0,
+      masteryActionUses: 0,
       evaluationResults: [],
       champion: null,
       lastRollbackAt: 0,
@@ -274,15 +289,15 @@
 
   function loadModel() {
     try {
-      const v9Stored = localStorage.getItem(STORE);
-      const saved = unpackStoredModel(JSON.parse(v9Stored || localStorage.getItem(LEGACY_STORE) || 'null'));
+      const v10Stored = localStorage.getItem(STORE);
+      const saved = unpackStoredModel(JSON.parse(v10Stored || localStorage.getItem(LEGACY_STORE) || 'null'));
       const fresh = blankModel();
       if (!saved || typeof saved !== 'object') return fresh;
       return {
         ...fresh,
         ...saved,
-        version: 9,
-        migratedFromV8: !v9Stored || !!saved.migratedFromV8,
+        version: 10,
+        migratedFromV8: !!saved.migratedFromV8,
         movementNet: validNetwork(saved.movementNet, MOVE_INPUTS, ACTIONS.length) ? saved.movementNet : fresh.movementNet,
         cardNet: validNetwork(saved.cardNet, CARD_INPUTS, 1) ? saved.cardNet : fresh.cardNet,
         movementTarget: validNetwork(saved.movementTarget, MOVE_INPUTS, ACTIONS.length) ? saved.movementTarget : copyNetwork(validNetwork(saved.movementNet, MOVE_INPUTS, ACTIONS.length) ? saved.movementNet : fresh.movementNet),
@@ -301,6 +316,9 @@
         eliteScores: Array.isArray(saved.eliteScores) ? saved.eliteScores.slice(-12) : [],
         demonstrations: Array.isArray(saved.demonstrations) ? saved.demonstrations.slice(-DEMONSTRATION_LIMIT) : [],
         demonstrationCount: Number(saved.demonstrationCount) || (Array.isArray(saved.demonstrations) ? saved.demonstrations.length : 0),
+        masteryPolicy: normalizeMasteryPolicy(saved.masteryPolicy),
+        masteryUpdates: Number(saved.masteryUpdates) || 0,
+        masteryActionUses: Number(saved.masteryActionUses) || 0,
         evaluationResults: Array.isArray(saved.evaluationResults) ? saved.evaluationResults.slice(-60).map(normalizeEvaluationRecord) : [],
         champion: saved.champion && validHead(saved.champion.earlyHead) && validHead(saved.champion.midHead) && validHead(saved.champion.lateHead) && validHead(saved.champion.hellHead) ? saved.champion : null,
         riskStats: normalizeRiskStats(saved.riskStats),
@@ -612,6 +630,9 @@
         eliteCount: model.elite.length,
         eliteScores: model.eliteScores,
         demonstrationCount: model.demonstrations.length,
+        masteryPolicy: model.masteryPolicy,
+        masteryUpdates: model.masteryUpdates,
+        masteryActionUses: model.masteryActionUses,
         riskStats: model.riskStats,
         riskUpdates: model.riskUpdates,
         eliteImitationSteps: model.eliteImitationSteps,
@@ -678,6 +699,9 @@
           model.eliteCount = Math.max(model.eliteCount || 0, Number(incomingModel.eliteCount) || 0);
           model.eliteScores = Array.isArray(incomingModel.eliteScores) ? incomingModel.eliteScores.slice(-12) : model.eliteScores;
           model.demonstrationCount = Math.max(model.demonstrationCount || 0, Number(incomingModel.demonstrationCount) || 0);
+          if (incomingModel.masteryPolicy) model.masteryPolicy = normalizeMasteryPolicy(incomingModel.masteryPolicy);
+          model.masteryUpdates = Math.max(model.masteryUpdates || 0, Number(incomingModel.masteryUpdates) || 0);
+          model.masteryActionUses = Math.max(model.masteryActionUses || 0, Number(incomingModel.masteryActionUses) || 0);
           if (incomingModel.riskStats) model.riskStats = normalizeRiskStats(incomingModel.riskStats);
           model.riskUpdates = Math.max(model.riskUpdates || 0, Number(incomingModel.riskUpdates) || 0);
           model.eliteImitationSteps = Math.max(model.eliteImitationSteps || 0, Number(incomingModel.eliteImitationSteps) || 0);
@@ -939,7 +963,20 @@
     return /^[wasd]$/.test(key) ? key : '';
   }
 
+  function manualDashAction(key) {
+    const id = key === 'd' ? 'dash-east' : key === 's' ? 'dash-south' : key === 'a' ? 'dash-west' : 'dash-north';
+    return ACTIONS.findIndex((action) => action.id === id);
+  }
+
+  function captureManualBurst(actionIndex) {
+    if (actionIndex < 0) return;
+    manualDemo.burstActionIndex = actionIndex;
+    manualDemo.burstUntil = Date.now() + 320;
+    captureManualDemo();
+  }
+
   function manualActionIndex() {
+    if (manualDemo.burstActionIndex >= 0 && Date.now() < manualDemo.burstUntil) return manualDemo.burstActionIndex;
     if (manualDemo.pressed.has(' ')) return ACTIONS.findIndex((action) => action.ultimate);
     const x = (manualDemo.pressed.has('d') ? 1 : 0) - (manualDemo.pressed.has('a') ? 1 : 0);
     const y = (manualDemo.pressed.has('s') ? 1 : 0) - (manualDemo.pressed.has('w') ? 1 : 0);
@@ -949,11 +986,12 @@
   }
 
   function rememberDemonstration(experience) {
-    if (!experience || experience.kind !== 'movement') return;
+    if (!experience || !['movement', 'card'].includes(experience.kind) || !Array.isArray(experience.input)) return;
     const saved = { ...experience, isDemonstration: true, priority: Number(experience.priority) || 1 };
     model.demonstrations.push(saved);
     if (model.demonstrations.length > DEMONSTRATION_LIMIT) model.demonstrations.splice(0, model.demonstrations.length - DEMONSTRATION_LIMIT);
     model.demonstrationCount = model.demonstrations.length;
+    if (saved.kind === 'movement') recordMasteryAction(saved);
   }
 
   function recordManualDemonstration(experience) {
@@ -1024,11 +1062,15 @@
     const canvas = document.querySelector('canvas#game');
     if (!canvas || typeof canvas.captureStream !== 'function' || typeof MediaRecorder !== 'function') return false;
     try {
-      manualDemo.stream = canvas.captureStream(30);
+      manualDemo.stream = canvas.captureStream(MANUAL_VIDEO_FPS);
       const mimeType = MediaRecorder.isTypeSupported && MediaRecorder.isTypeSupported('video/webm;codecs=vp9')
         ? 'video/webm;codecs=vp9' : 'video/webm';
       manualDemo.chunks = [];
-      manualDemo.video = new MediaRecorder(manualDemo.stream, { mimeType });
+      try {
+        manualDemo.video = new MediaRecorder(manualDemo.stream, { mimeType, videoBitsPerSecond: MANUAL_VIDEO_BITS_PER_SECOND });
+      } catch (_) {
+        manualDemo.video = new MediaRecorder(manualDemo.stream, { mimeType });
+      }
       manualDemo.video.ondataavailable = (event) => { if (event.data && event.data.size) manualDemo.chunks.push(event.data); };
       manualDemo.video.onstop = () => {
         const chunks = manualDemo.chunks;
@@ -1062,6 +1104,9 @@
     manualDemo.startedAt = Date.now();
     manualDemo.pressed.clear();
     manualDemo.decision = null;
+    manualDemo.keyDownAt = {};
+    manualDemo.burstActionIndex = -1;
+    manualDemo.burstUntil = 0;
     const videoStarted = startVideoRecording();
     manualDemo.timer = setInterval(captureManualDemo, 120);
     run.status = videoStarted
@@ -1079,7 +1124,13 @@
     manualDemo.timer = null;
     manualDemo.active = false;
     manualDemo.pressed.clear();
+    manualDemo.burstActionIndex = -1;
+    manualDemo.burstUntil = 0;
     stopVideoRecording();
+    if (isCoordinator()) {
+      saveModel(true);
+      shareSnapshot(null, true);
+    }
     event(`Manual demonstration ended with ${model.demonstrationCount} retained action samples.`);
     run.status = resume ? 'Manual demo saved locally; autoplay resumes shortly.' : 'Manual demo saved locally.';
     renderPanel(true);
@@ -1089,12 +1140,40 @@
   addEventListener('keydown', (event) => {
     if (!manualDemo.active) return;
     const key = manualKey(event);
-    if (key) manualDemo.pressed.add(key);
+    if (!key || event.repeat) return;
+    const now = Date.now();
+    if (key === ' ') captureManualBurst(ACTIONS.findIndex((action) => action.ultimate));
+    else if (now - (manualDemo.keyDownAt[key] || 0) < 280) captureManualBurst(manualDashAction(key));
+    manualDemo.keyDownAt[key] = now;
+    manualDemo.pressed.add(key);
   }, true);
   addEventListener('keyup', (event) => {
     if (!manualDemo.active) return;
     const key = manualKey(event);
     if (key) manualDemo.pressed.delete(key);
+  }, true);
+
+  addEventListener('pointerdown', (event) => {
+    if (!manualDemo.active || !event.target || !event.target.closest) return;
+    const selected = event.target.closest('#upRow .up-card');
+    if (!selected || !visible(selected)) return;
+    const observation = observe();
+    const cards = [...document.querySelectorAll('#upRow .up-card')].filter(visible);
+    if (!cards.length) return;
+    const slate = cardSlateFeatures(cards);
+    cards.forEach((card) => {
+      const chosen = card === selected;
+      recordManualDemonstration({
+        kind: 'card',
+        input: cardInput(observation, card.innerText || '', slate),
+        reward: chosen ? 5 : -1.25,
+        done: true,
+        steps: 1,
+        phase: phaseFor(observation),
+        isDemonstration: true,
+        manualCardChoice: chosen,
+      });
+    });
   }, true);
 
   function clip(value, low, high) { return Math.max(low, Math.min(high, value)); }
@@ -1180,6 +1259,76 @@
     const health = clip(Number(input[0]) || 0.5, 0, 1);
     const urgency = 0.35 + (1 - health) * 0.9 + (phase === 'hell' ? 0.18 : phase === 'late' ? 0.10 : 0);
     return upper * urgency * 0.48;
+  }
+
+  function masteryKey(input, phase, includeCooldowns = true) {
+    const value = (index) => clip(Number(input && input[index]) || 0.5, 0, 1);
+    const health = Math.min(4, Math.floor(value(0) * 5));
+    const centreThreat = Math.min(3, Math.floor(value(14) * 4));
+    const hazard = Math.min(3, Math.floor(value(17) * 4));
+    const vertical = value(15) < 0.42 ? 'n' : value(15) > 0.58 ? 's' : 'c';
+    const horizontal = value(16) < 0.42 ? 'w' : value(16) > 0.58 ? 'e' : 'c';
+    const cooldowns = includeCooldowns ? `:${value(12) > 0.5 ? 1 : 0}${value(13) > 0.5 ? 1 : 0}` : '';
+    return `${phase || 'early'}:${health}:${centreThreat}:${hazard}:${vertical}${horizontal}${cooldowns}`;
+  }
+
+  function normalizeMasteryPolicy(value) {
+    if (!value || typeof value !== 'object') return {};
+    return Object.entries(value)
+      .map(([key, stat]) => [key, {
+        visits: Math.max(0, Math.min(100000, Number(stat && stat.visits) || 0)),
+        actions: Array.from({ length: ACTIONS.length }, (_, index) => Math.max(0, Math.min(100000, Number(stat && stat.actions && stat.actions[index]) || 0))),
+        at: Math.max(0, Number(stat && stat.at) || 0),
+      }])
+      .filter(([key, stat]) => key.length < 60 && stat.visits > 0)
+      .sort((left, right) => right[1].at - left[1].at)
+      .slice(0, MASTERY_STATS_LIMIT)
+      .reduce((all, [key, stat]) => ({ ...all, [key]: stat }), {});
+  }
+
+  function updateMasteryKey(key, actionIndex) {
+    if (!key || actionIndex < 0 || actionIndex >= ACTIONS.length) return;
+    const stat = model.masteryPolicy[key] || { visits: 0, actions: Array(ACTIONS.length).fill(0), at: 0 };
+    stat.visits = Math.min(100000, stat.visits + 1);
+    stat.actions[actionIndex] = Math.min(stat.visits, (stat.actions[actionIndex] || 0) + 1);
+    stat.at = Date.now();
+    model.masteryPolicy[key] = stat;
+  }
+
+  function recordMasteryAction(experience) {
+    if (!experience || experience.kind !== 'movement' || !Array.isArray(experience.input) || !Number.isInteger(experience.actionIndex)) return;
+    const phase = phaseFor(experience);
+    updateMasteryKey(masteryKey(experience.input, phase, true), experience.actionIndex);
+    updateMasteryKey(masteryKey(experience.input, phase, false), experience.actionIndex);
+    model.masteryUpdates += 1;
+    if (Object.keys(model.masteryPolicy).length > MASTERY_STATS_LIMIT * 1.08) model.masteryPolicy = normalizeMasteryPolicy(model.masteryPolicy);
+  }
+
+  function rebuildMasteryFromDemonstrations() {
+    model.masteryPolicy = {};
+    model.masteryUpdates = 0;
+    model.demonstrations.forEach((experience) => {
+      if (experience && experience.kind === 'movement') recordMasteryAction(experience);
+    });
+  }
+
+  function masteryActionPrior(input, phase) {
+    if (!model.settings.immortalMode) return { bonuses: Array(ACTIONS.length).fill(0), confidence: 0 };
+    const exact = model.masteryPolicy[masteryKey(input, phase, true)];
+    const broad = model.masteryPolicy[masteryKey(input, phase, false)];
+    const stat = exact && exact.visits >= MASTERY_MIN_VISITS ? exact : broad;
+    if (!stat || stat.visits < MASTERY_MIN_VISITS) return { bonuses: Array(ACTIONS.length).fill(0), confidence: 0 };
+    const counts = stat.actions || [];
+    const winner = Math.max(...counts, 0);
+    const purity = winner / Math.max(1, stat.visits);
+    const support = clip(Math.log2(stat.visits + 1) / 4, 0, 1);
+    const confidence = support * purity;
+    if (confidence < 0.28) return { bonuses: Array(ACTIONS.length).fill(0), confidence: 0 };
+    const peak = 0.12 + MASTERY_MAX_BONUS * confidence;
+    return {
+      confidence,
+      bonuses: counts.map((count) => count ? peak * (count / winner) : 0),
+    };
   }
 
   function cardSlateFeatures(cards) {
@@ -1386,6 +1535,14 @@
 
   function samplePrioritizedReplay() {
     const preferredPhase = preferredReplayPhase();
+    if (model.demonstrations.length && Math.random() < DEMONSTRATION_REPLAY_RATE) {
+      for (let attempt = 0; attempt < 18; attempt += 1) {
+        const demo = model.demonstrations[Math.floor(Math.random() * model.demonstrations.length)];
+        if (demo && phaseFor(demo) === preferredPhase) return { ...demo, importanceWeight: 1.25, isDemonstration: true };
+      }
+      const demo = model.demonstrations[Math.floor(Math.random() * model.demonstrations.length)];
+      if (demo) return { ...demo, importanceWeight: 1.25, isDemonstration: true };
+    }
     if (model.elite.length && Math.random() < 0.45) {
       const elite = sampleEliteForPhase(preferredPhase);
       if (elite) {
@@ -1547,8 +1704,11 @@
     const intent = tacticalIntent(observation);
     run.intent = intent;
     const input = movementInput(observation);
-    if (Math.random() < actingExplorationRate(head)) {
-      const phase = phaseFor(observation);
+    const phase = phaseFor(observation);
+    const mastery = masteryActionPrior(input, phase);
+    // Where the player's demonstrated policy has repeated the same safe
+    // choice, follow it instead of injecting random exploration into it.
+    if (mastery.confidence < 0.28 && Math.random() < actingExplorationRate(head)) {
       const candidates = ACTIONS.filter((pattern, index) => safetyPenalty(observation, pattern) < 0.04
         && riskPenaltyFor(input, phase, index) < 0.12);
       return (candidates.length ? candidates : ACTIONS)[Math.floor(Math.random() * (candidates.length || ACTIONS.length))];
@@ -1566,10 +1726,12 @@
       // Online-versus-frozen-target disagreement is a cheap uncertainty proxy.
       // It is limited to a small exploration bonus and disabled for evaluation.
       const uncertaintyBonus = run.evaluation ? 0 : Math.min(0.055, Math.abs(prediction - targetValues[index]) * 0.025);
-      const learnedRiskPenalty = riskPenaltyFor(input, phaseFor(observation), index);
-      const score = prediction + defensiveNudge + styleNudge + intentBonus(intent, pattern, observation) + uncertaintyBonus - safetyPenalty(observation, pattern) - learnedRiskPenalty;
-      if (!choice || score > choice.score) choice = { pattern, score };
+      const learnedRiskPenalty = riskPenaltyFor(input, phase, index);
+      const masteryBonus = mastery.bonuses[index] || 0;
+      const score = prediction + defensiveNudge + styleNudge + intentBonus(intent, pattern, observation) + uncertaintyBonus + masteryBonus - safetyPenalty(observation, pattern) - learnedRiskPenalty;
+      if (!choice || score > choice.score) choice = { pattern, score, masteryBonus };
     });
+    if (choice.masteryBonus > 0.08) model.masteryActionUses += 1;
     return choice.pattern;
   }
 
@@ -2195,7 +2357,7 @@
       priority: experience.priority,
     });
     const payload = {
-      format: 'pine-autopilot-training-v9',
+      format: 'pine-autopilot-training-v10',
       exportedAt: new Date().toISOString(),
       stateInputs: STATE_INPUTS,
       cardInputs: CARD_INPUTS,
@@ -2212,6 +2374,8 @@
         eliteScores: model.eliteScores,
         championMedian: model.champion ? model.champion.score : null,
         lastRollbackAt: model.lastRollbackAt || null,
+        immortalPolicyUpdates: model.masteryUpdates,
+        immortalSituations: Object.keys(model.masteryPolicy).length,
       },
       recentReplay: model.replay.slice(-3000).map(cleanExperience),
       eliteReplay: model.elite.slice(-600).map(cleanExperience),
@@ -2231,7 +2395,7 @@
 
   function downloadMpsCheckpoint() {
     const payload = {
-      format: 'pine-autopilot-checkpoint-v9',
+      format: 'pine-autopilot-checkpoint-v10',
       exportedAt: new Date().toISOString(),
       contract: {
         stateInputs: STATE_INPUTS,
@@ -2263,7 +2427,7 @@
     reader.onload = () => {
       try {
         const payload = JSON.parse(String(reader.result || ''));
-        if (!payload || !['pine-autopilot-checkpoint-v8', 'pine-autopilot-checkpoint-v9'].includes(payload.format) || !payload.model) throw new Error('format');
+        if (!payload || !['pine-autopilot-checkpoint-v8', 'pine-autopilot-checkpoint-v9', 'pine-autopilot-checkpoint-v10'].includes(payload.format) || !payload.model) throw new Error('format');
         const incoming = unpackStoredModel(payload.model);
         if (!validHead(incoming) || !validHead(incoming.midHead) || !validHead(incoming.lateHead) || !validHead(incoming.hellHead)) throw new Error('network shape');
         const early = applyHeadSnapshot(model, headSnapshot(incoming));
@@ -2313,7 +2477,7 @@
       return { phase, runs: scores.length, medianSeconds: scores.length ? median(scores) : null };
     });
     return {
-      format: 'pine-autopilot-diagnostics-v9',
+      format: 'pine-autopilot-diagnostics-v10',
       role: learnerRole(),
       workerProfile,
       uniqueExperiences: model.uniqueExperiences,
@@ -2337,6 +2501,10 @@
       replaySamplesVisible: model.replay.length,
       eliteSamplesVisible: model.elite.length,
       demonstrationSamplesVisible: model.demonstrations.length,
+      immortalPolicyEnabled: !!model.settings.immortalMode,
+      immortalSituationsVisible: Object.keys(model.masteryPolicy).length,
+      immortalPolicyUpdates: model.masteryUpdates,
+      immortalPolicyUses: model.masteryActionUses,
       eliteImitationSteps: model.eliteImitationSteps,
       riskStatesVisible: Object.keys(model.riskStats).length,
       riskUpdates: model.riskUpdates,
@@ -2380,6 +2548,7 @@
         <div class="status" id="status"></div><div class="stats" id="stats"></div>
         <div class="controls"><button id="arm" type="button">Arm loop</button><button id="stop" class="stop" type="button">Stop</button></div>
         <label style="display:block;margin-top:8px;color:#cfc5b3"><input id="safetyRestart" type="checkbox"> Restart safely at 60:00</label>
+        <label style="display:block;margin-top:5px;color:#cfc5b3"><input id="immortalMode" type="checkbox"> Protect manual “immortal” policy</label>
         <details><summary>Neural learner</summary><div id="learning"></div><button id="manualDemo" type="button" style="margin-top:7px">Record manual demo</button><button id="diagnostics" type="button" style="margin-top:7px">Copy diagnostics</button><button id="export" type="button" style="margin-top:7px">Download training data</button><button id="checkpoint" type="button" style="margin-top:7px">Download MPS checkpoint</button><button id="import" type="button" style="margin-top:7px">Import MPS challenger</button><input id="checkpointFile" type="file" accept="application/json,.json" hidden><button id="restore" type="button" style="margin-top:7px">Restore champion</button><button id="reset" type="button" style="margin-top:7px">Reset neural model</button></details>
         <div class="note">Auto-starts on page load · Double DQN · risk-aware survival · one central learner. Every sixth run is a blind champion/challenger evaluation. Manual demo records local video/actions; no rank submission.</div>
       </main></section>`;
@@ -2389,6 +2558,12 @@
     shadow.querySelector('#safetyRestart').addEventListener('change', (event) => {
       model.settings.safetyRestartAt60 = event.target.checked;
       saveModel();
+      renderPanel();
+    });
+    shadow.querySelector('#immortalMode').addEventListener('change', (event) => {
+      model.settings.immortalMode = event.target.checked;
+      saveModel(true);
+      if (isCoordinator()) shareSnapshot(null, true);
       renderPanel();
     });
     shadow.querySelector('#export').addEventListener('click', downloadTrainingData);
@@ -2441,6 +2616,7 @@
     panel.querySelector('#arm').disabled = run.enabled || manualDemo.active;
     panel.querySelector('#stop').disabled = !run.enabled;
     panel.querySelector('#safetyRestart').checked = !!model.settings.safetyRestartAt60;
+    panel.querySelector('#immortalMode').checked = !!model.settings.immortalMode;
     panel.querySelector('#restore').disabled = !model.champion;
     panel.querySelector('#import').disabled = !isCoordinator();
     panel.querySelector('#manualDemo').textContent = manualDemo.active ? 'Stop demo & resume bot' : 'Record manual demo';
@@ -2457,9 +2633,9 @@
     const tournamentText = tournament
       ? `\nTournament: candidate ${formatTime(tournament.candidate)} vs champion ${formatTime(tournament.champion)} · lower ${formatTime(tournament.candidateLower)}/${formatTime(tournament.championLower)} (${tournament.candidateRuns}/${TOURNAMENT_WINDOW} each)`
       : `\nTournament: candidate ${cleanEvaluations.length}/${TOURNAMENT_WINDOW} · champion ${championEvaluations.length}/${TOURNAMENT_WINDOW} clean evals`;
-    const migrationText = model.migratedFromV8 ? '\nImported v8 challenger and champion' : '';
+    const migrationText = model.migratedFromV8 ? '\nImported earlier challenger and champion' : '';
     const timingText = run.timingWarnings ? `\nTiming: ${run.largestGameTimeJump.toFixed(1)} s max jump · ${run.timingWarnings} warning(s) · ${run.lowQualityDropped} transition(s) dropped` : '';
-    const top = `Role: ${learnerRole()} · ${workerProfile} worker\nDQN gradient steps: ${experienceCount()}\nUnique shared experiences: ${model.uniqueExperiences}\nEarly ε: ${(explorationRate(model) * 100).toFixed(1)}% · Mid: ${(explorationRate(model.midHead) * 100).toFixed(1)}%\nLate ε: ${(explorationRate(model.lateHead) * 100).toFixed(1)}% · Hell: ${(explorationRate(model.hellHead) * 100).toFixed(1)}%\nReplay: ${model.replay.length}/${REPLAY_LIMIT} · elite: ${model.eliteCount || model.elite.length}/${ELITE_LIMIT} · demos: ${model.demonstrationCount || model.demonstrations.length}/${DEMONSTRATION_LIMIT}\nReplay phase mix: E${replayPhaseCounts.early} M${replayPhaseCounts.mid} L${replayPhaseCounts.late} H${replayPhaseCounts.hell}\nAdaptive replay: ${adaptiveReplayBatch}/transition · 45% elite target · imitate ${model.eliteImitationSteps}\nRisk shield: ${Object.keys(model.riskStats).length} learned states · ${model.riskUpdates} outcomes\nIdle consolidation: ${model.consolidationSteps} updates / ${model.consolidationPasses} passes\nIntent: ${run.intent} · shield: colour-threat aware\nCandidate held-out: ${cleanEvaluations.length ? formatTime(evaluationMedian) : 'collecting…'} (${cleanEvaluations.length} accepted / ${model.evaluationResults.length} total; ≤${(MAX_EVALUATION_DROPPED_RATE * 100).toFixed(0)}% drops)${tournamentText}${trendText}${championText}${migrationText}${timingText}`;
+    const top = `Role: ${learnerRole()} · ${workerProfile} worker\nDQN gradient steps: ${experienceCount()}\nUnique shared experiences: ${model.uniqueExperiences}\nEarly ε: ${(explorationRate(model) * 100).toFixed(1)}% · Mid: ${(explorationRate(model.midHead) * 100).toFixed(1)}%\nLate ε: ${(explorationRate(model.lateHead) * 100).toFixed(1)}% · Hell: ${(explorationRate(model.hellHead) * 100).toFixed(1)}%\nReplay: ${model.replay.length}/${REPLAY_LIMIT} · elite: ${model.eliteCount || model.elite.length}/${ELITE_LIMIT} · demos: ${model.demonstrationCount || model.demonstrations.length}/${DEMONSTRATION_LIMIT}\nImmortal policy: ${model.settings.immortalMode ? 'protected' : 'off'} · ${Object.keys(model.masteryPolicy).length} learned situations · used ${model.masteryActionUses} times\nReplay phase mix: E${replayPhaseCounts.early} M${replayPhaseCounts.mid} L${replayPhaseCounts.late} H${replayPhaseCounts.hell}\nAdaptive replay: ${adaptiveReplayBatch}/transition · ${Math.round(DEMONSTRATION_REPLAY_RATE * 100)}% demo target · imitate ${model.eliteImitationSteps}\nRisk shield: ${Object.keys(model.riskStats).length} learned states · ${model.riskUpdates} outcomes\nIdle consolidation: ${model.consolidationSteps} updates / ${model.consolidationPasses} passes\nIntent: ${run.intent} · shield: colour-threat aware\nCandidate held-out: ${cleanEvaluations.length ? formatTime(evaluationMedian) : 'collecting…'} (${cleanEvaluations.length} accepted / ${model.evaluationResults.length} total; ≤${(MAX_EVALUATION_DROPPED_RATE * 100).toFixed(0)}% drops)${tournamentText}${trendText}${championText}${migrationText}${timingText}`;
     const learning = panel.querySelector('#learning');
     learning.textContent = top;
     learning.style.whiteSpace = 'pre-line';
