@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 
 /*
- * Local-only report for a file downloaded from Pine Autopilot v5 through v10.
+ * Local-only report for a file downloaded from Pine Autopilot v5 through v11.
  * Usage: node offline-analysis.mjs pine-autopilot-training-....json
  */
 
@@ -14,8 +14,8 @@ if (!file) {
 }
 
 const report = JSON.parse(fs.readFileSync(file, 'utf8'));
-if (!['pine-autopilot-training-v5', 'pine-autopilot-training-v6', 'pine-autopilot-training-v7', 'pine-autopilot-training-v8', 'pine-autopilot-training-v9', 'pine-autopilot-training-v10'].includes(report.format)) {
-  throw new Error('Not a Pine Autopilot v5 through v10 training export.');
+if (!['pine-autopilot-training-v5', 'pine-autopilot-training-v6', 'pine-autopilot-training-v7', 'pine-autopilot-training-v8', 'pine-autopilot-training-v9', 'pine-autopilot-training-v10', 'pine-autopilot-training-v11'].includes(report.format)) {
+  throw new Error('Not a Pine Autopilot v5 through v11 training export.');
 }
 
 const median = (values) => {
@@ -54,10 +54,10 @@ const evaluationQuality = (entry) => {
 };
 const cleanEvaluations = allEvaluations.filter((entry) => entry && evaluationQuality(entry).clean);
 const tournamentGeneration = Number(report.metrics.tournamentGeneration);
-const currentCandidate = ['pine-autopilot-training-v8', 'pine-autopilot-training-v9', 'pine-autopilot-training-v10'].includes(report.format)
+const currentCandidate = ['pine-autopilot-training-v8', 'pine-autopilot-training-v9', 'pine-autopilot-training-v10', 'pine-autopilot-training-v11'].includes(report.format)
   ? cleanEvaluations.filter((entry) => entry.policy === 'candidate' && entry.generation === tournamentGeneration)
   : [];
-const currentChampion = ['pine-autopilot-training-v8', 'pine-autopilot-training-v9', 'pine-autopilot-training-v10'].includes(report.format)
+const currentChampion = ['pine-autopilot-training-v8', 'pine-autopilot-training-v9', 'pine-autopilot-training-v10', 'pine-autopilot-training-v11'].includes(report.format)
   ? cleanEvaluations.filter((entry) => entry.policy === 'champion' && entry.generation === tournamentGeneration)
   : [];
 const candidateEvaluations = currentCandidate.length
@@ -75,7 +75,7 @@ if (evaluations.length >= 2) {
   console.log(`Held-out trend: ${formatTime(early)} -> ${formatTime(recent)} (${change >= 0 ? '+' : ''}${change.toFixed(1)}%)`);
 }
 
-if (['pine-autopilot-training-v8', 'pine-autopilot-training-v9', 'pine-autopilot-training-v10'].includes(report.format)) {
+if (['pine-autopilot-training-v8', 'pine-autopilot-training-v9', 'pine-autopilot-training-v10', 'pine-autopilot-training-v11'].includes(report.format)) {
   console.log(`Tournament generation: ${Number.isFinite(tournamentGeneration) ? tournamentGeneration : 'unknown'}`);
   console.log(`Current tournament clean runs: candidate ${currentCandidate.length}/5 · champion ${currentChampion.length}/5`);
   if (currentCandidate.length >= 5 && currentChampion.length >= 5) {
@@ -86,7 +86,7 @@ if (['pine-autopilot-training-v8', 'pine-autopilot-training-v9', 'pine-autopilot
   }
 }
 
-if (['pine-autopilot-training-v6', 'pine-autopilot-training-v7', 'pine-autopilot-training-v8', 'pine-autopilot-training-v9', 'pine-autopilot-training-v10'].includes(report.format)) {
+if (['pine-autopilot-training-v6', 'pine-autopilot-training-v7', 'pine-autopilot-training-v8', 'pine-autopilot-training-v9', 'pine-autopilot-training-v10', 'pine-autopilot-training-v11'].includes(report.format)) {
   console.log('\nClean held-out results by furthest phase:');
   ['early', 'mid', 'late', 'hell'].forEach((phase) => {
     const values = candidateEvaluations.filter((entry) => (entry.phase || 'early') === phase).map((entry) => entry.seconds);

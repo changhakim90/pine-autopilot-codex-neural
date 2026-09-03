@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Pine Autopilot — Joe Learning Loop
 // @namespace    https://pineandco.online/
-// @version      10.0.0
+// @version      11.0.0
 // @description  Local-only neural-network Joe player for Pine & Co Cocktail Defense.
 // @match        https://pineandco.online/*
 // @homepageURL  https://github.com/changhakim90/pine-autopilot-codex-neural
@@ -24,12 +24,12 @@
   if (window.__pineAutopilotLoaded) return;
   window.__pineAutopilotLoaded = true;
 
-  const VERSION = '10.0.0';
-  // v10 preserves v9's neural weights and turns player demonstrations into a
-  // compact, protected action prior. Ordinary exploration cannot overwrite it.
-  const STORE = 'pine-autopilot:joe:neural:v10';
-  const LEGACY_STORE = 'pine-autopilot:joe:neural:v9';
-  const CHANNEL = 'pine-autopilot:neural:v10';
+  const VERSION = '11.0.0';
+  // v11 preserves v10's model and makes manual/elite transfers durable when
+  // they originate in an experience-worker tab.
+  const STORE = 'pine-autopilot:joe:neural:v11';
+  const LEGACY_STORE = 'pine-autopilot:joe:neural:v10';
+  const CHANNEL = 'pine-autopilot:neural:v11';
   // At 100× game speed, a 55 ms wall-clock poll skips several game seconds.
   // Ten ms keeps the 1.2-second policy horizon meaningful while the page is
   // active, without asking the game for more animation frames.
@@ -78,6 +78,12 @@
   const MASTERY_MAX_BONUS = 0.82;
   const MANUAL_VIDEO_FPS = 12;
   const MANUAL_VIDEO_BITS_PER_SECOND = 1800000;
+  const TRANSFER_OUTBOX_PREFIX = 'pine-autopilot:joe:transfer:v11:';
+  const MANUAL_OUTBOX_LIMIT = 180;
+  const ELITE_OUTBOX_LIMIT = 4;
+  const TRANSFER_ID_LIMIT = 2500;
+  const TRANSFER_DRAIN_MS = 350;
+  const TRANSFER_DRAIN_BATCH = 18;
   const RISK_MIN_SAMPLES = 8;
   const RISK_STATS_LIMIT = 1800;
   const IDLE_CONSOLIDATION_MAX_STEPS = 28;
@@ -106,7 +112,7 @@
   ];
 
   const model = loadModel();
-  // v9 demonstrations become the v10 protected policy on first load. The
+  // Earlier demonstrations become the protected policy on first load. The
   // compact policy survives after the raw 500-sample demo window rotates.
   if (!Object.keys(model.masteryPolicy || {}).length && model.demonstrations.length) rebuildMasteryFromDemonstrations();
   let adaptiveReplayBatch = REPLAY_BATCH;
@@ -204,6 +210,7 @@
     keyDownAt: {},
     burstActionIndex: -1,
     burstUntil: 0,
+    sequence: 0,
   };
 
   const panel = mountPanel();
@@ -231,7 +238,7 @@
     const midHead = createHead(earlyHead);
     const lateHead = createHead(midHead);
     return {
-      version: 10,
+      version: 11,
       completedRuns: 0,
       bestSeconds: 0,
       totalSeconds: 0,
@@ -256,6 +263,10 @@
       masteryPolicy: {},
       masteryUpdates: 0,
       masteryActionUses: 0,
+      manualTransferIds: [],
+      eliteTransferIds: [],
+      manualTransfersAccepted: 0,
+      eliteTransfersAccepted: 0,
       evaluationResults: [],
       champion: null,
       lastRollbackAt: 0,
@@ -289,14 +300,14 @@
 
   function loadModel() {
     try {
-      const v10Stored = localStorage.getItem(STORE);
-      const saved = unpackStoredModel(JSON.parse(v10Stored || localStorage.getItem(LEGACY_STORE) || 'null'));
+      const v11Stored = localStorage.getItem(STORE);
+      const saved = unpackStoredModel(JSON.parse(v11Stored || localStorage.getItem(LEGACY_STORE) || 'null'));
       const fresh = blankModel();
       if (!saved || typeof saved !== 'object') return fresh;
       return {
         ...fresh,
         ...saved,
-        version: 10,
+        version: 11,
         migratedFromV8: !!saved.migratedFromV8,
         movementNet: validNetwork(saved.movementNet, MOVE_INPUTS, ACTIONS.length) ? saved.movementNet : fresh.movementNet,
         cardNet: validNetwork(saved.cardNet, CARD_INPUTS, 1) ? saved.cardNet : fresh.cardNet,
@@ -319,6 +330,10 @@
         masteryPolicy: normalizeMasteryPolicy(saved.masteryPolicy),
         masteryUpdates: Number(saved.masteryUpdates) || 0,
         masteryActionUses: Number(saved.masteryActionUses) || 0,
+        manualTransferIds: Array.isArray(saved.manualTransferIds) ? saved.manualTransferIds.slice(-TRANSFER_ID_LIMIT).filter((id) => typeof id === 'string') : [],
+        eliteTransferIds: Array.isArray(saved.eliteTransferIds) ? saved.eliteTransferIds.slice(-TRANSFER_ID_LIMIT).filter((id) => typeof id === 'string') : [],
+        manualTransfersAccepted: Number(saved.manualTransfersAccepted) || 0,
+        eliteTransfersAccepted: Number(saved.eliteTransfersAccepted) || 0,
         evaluationResults: Array.isArray(saved.evaluationResults) ? saved.evaluationResults.slice(-60).map(normalizeEvaluationRecord) : [],
         champion: saved.champion && validHead(saved.champion.earlyHead) && validHead(saved.champion.midHead) && validHead(saved.champion.lateHead) && validHead(saved.champion.hellHead) ? saved.champion : null,
         riskStats: normalizeRiskStats(saved.riskStats),
@@ -513,6 +528,97 @@
   function event(message) {
     model.events.push({ at: Date.now(), message });
     model.events = model.events.slice(-60);
+  }
+
+  function transferOutboxKey(kind) {
+    return `${TRANSFER_OUTBOX_PREFIX}${kind}:${learnerId}`;
+  }
+
+  function readTransferOutbox(key) {
+    try {
+      const entries = JSON.parse(localStorage.getItem(key) || '[]');
+      return Array.isArray(entries) ? entries : [];
+    } catch (_) {
+      return [];
+    }
+  }
+
+  function writeTransferOutbox(key, entries) {
+    try {
+      localStorage.setItem(key, JSON.stringify(entries));
+      return true;
+    } catch (_) {
+      return false;
+    }
+  }
+
+  function queueTransfer(kind, payload, limit) {
+    const key = transferOutboxKey(kind);
+    const entries = readTransferOutbox(key);
+    entries.push(payload);
+    writeTransferOutbox(key, entries.slice(-limit));
+  }
+
+  function rememberTransferId(kind, id) {
+    if (!id || typeof id !== 'string') return true;
+    const field = kind === 'manual' ? 'manualTransferIds' : 'eliteTransferIds';
+    if (model[field].includes(id)) return false;
+    model[field].push(id);
+    if (model[field].length > TRANSFER_ID_LIMIT) model[field].splice(0, model[field].length - TRANSFER_ID_LIMIT);
+    return true;
+  }
+
+  function acceptManualTransfer(experience) {
+    if (!experience || !Array.isArray(experience.input)) return false;
+    if (!rememberTransferId('manual', experience.transferId)) return true;
+    rememberDemonstration(experience);
+    trainExperience(experience, true);
+    model.manualTransfersAccepted += 1;
+    return true;
+  }
+
+  function acceptEliteTransfer(episode) {
+    if (!episode || !Array.isArray(episode.transitions)) return false;
+    if (!rememberTransferId('elite', episode.transferId)) return true;
+    rememberEliteEpisode(episode);
+    model.eliteTransfersAccepted += 1;
+    return true;
+  }
+
+  let lastTransferDrainAt = 0;
+
+  function drainDurableTransfers(force = false) {
+    if (!isCoordinator() || (!force && Date.now() - lastTransferDrainAt < TRANSFER_DRAIN_MS)) return 0;
+    lastTransferDrainAt = Date.now();
+    let accepted = 0;
+    const keys = [];
+    try {
+      for (let index = 0; index < localStorage.length; index += 1) {
+        const key = localStorage.key(index);
+        if (key && key.startsWith(TRANSFER_OUTBOX_PREFIX)) keys.push(key);
+      }
+    } catch (_) { return 0; }
+    keys.forEach((key) => {
+      if (accepted >= TRANSFER_DRAIN_BATCH) return;
+      const kind = key.slice(TRANSFER_OUTBOX_PREFIX.length).split(':')[0];
+      const entries = readTransferOutbox(key);
+      entries.slice(0, TRANSFER_DRAIN_BATCH - accepted).forEach((entry) => {
+        const received = kind === 'manual' ? acceptManualTransfer(entry) : kind === 'elite' ? acceptEliteTransfer(entry) : false;
+        if (received) accepted += 1;
+      });
+      // Re-read before retaining unseen entries so a worker append that landed
+      // while this tab trained is kept for the next drain.
+      const latest = readTransferOutbox(key);
+      const idField = kind === 'manual' ? 'manualTransferIds' : 'eliteTransferIds';
+      const pending = latest.filter((entry) => !entry || !entry.transferId || !model[idField].includes(entry.transferId));
+      writeTransferOutbox(key, pending);
+    });
+    if (accepted) {
+      event(`Durably accepted ${accepted} worker learning transfer${accepted === 1 ? '' : 's'}.`);
+      saveModel(true);
+      shareSnapshot(null, true);
+    }
+    return accepted;
   }
 
   function normalizeRiskStats(value) {
@@ -729,12 +835,11 @@
         return;
       }
       if (data.type === 'demonstration' && data.experience && isCoordinator()) {
-        rememberDemonstration(data.experience);
-        trainExperience(data.experience, true);
+        acceptManualTransfer(data.experience);
         return;
       }
       if (data.type === 'eliteEpisode' && data.episode && isCoordinator()) {
-        rememberEliteEpisode(data.episode);
+        acceptEliteTransfer(data.episode);
         return;
       }
       if (data.type === 'restoreChampionRequest' && isCoordinator()) {
@@ -995,12 +1100,18 @@
   }
 
   function recordManualDemonstration(experience) {
+    const transfer = {
+      ...experience,
+      transferId: experience.transferId || `${learnerId}:manual:${Date.now()}:${++manualDemo.sequence}`,
+    };
+    // Broadcast is fast when every tab is healthy; the per-worker outbox is
+    // the durable path when a tab reloads or a broadcast is missed.
+    queueTransfer('manual', transfer, MANUAL_OUTBOX_LIMIT);
     if (isCoordinator()) {
-      rememberDemonstration(experience);
-      trainExperience(experience, false);
+      drainDurableTransfers(true);
       return;
     }
-    if (peerChannel) peerChannel.postMessage({ type: 'demonstration', from: learnerId, experience });
+    if (peerChannel) peerChannel.postMessage({ type: 'demonstration', from: learnerId, experience: transfer });
   }
 
   function settleManualDemoDecision(observation, terminal = false) {
@@ -2039,7 +2150,8 @@
     model.evaluationResults = model.evaluationResults.slice(-40);
     if (evaluation.quality) event(`${evaluation.policy} evaluation: ${formatTime(result.seconds)} · ${evaluation.phase} (${(evaluation.droppedRate * 100).toFixed(1)}% dropped)`);
     else event(`Evaluation excluded: ${(evaluation.droppedRate * 100).toFixed(1)}% dropped decisions.`);
-    if (!promoteChampionIfBetter()) maybeAutomaticRollback();
+    if (!model.champion) bootstrapChampionFromHistory();
+    else if (!promoteChampionIfBetter()) maybeAutomaticRollback();
     saveModel();
   }
 
@@ -2062,8 +2174,13 @@
 
   function submitEliteEpisode(seconds) {
     if (run.evaluation || !run.episodeTransitions.length) return;
-    const episode = { seconds, transitions: run.episodeTransitions.slice() };
-    if (isCoordinator()) rememberEliteEpisode(episode);
+    const episode = {
+      seconds,
+      transitions: run.episodeTransitions.slice(),
+      transferId: `${learnerId}:elite:${Date.now()}:${Math.random().toString(36).slice(2, 8)}`,
+    };
+    queueTransfer('elite', episode, ELITE_OUTBOX_LIMIT);
+    if (isCoordinator()) drainDurableTransfers(true);
     else if (peerChannel) peerChannel.postMessage({ type: 'eliteEpisode', from: learnerId, episode });
   }
 
@@ -2283,6 +2400,7 @@
 
   function tick() {
     if (!run.enabled) return;
+    drainDurableTransfers();
     const observation = observe();
     if (observation.playing && run.lastObservedGameTime !== null && observation.time >= run.lastObservedGameTime) {
       const jump = observation.time - run.lastObservedGameTime;
@@ -2357,7 +2475,7 @@
       priority: experience.priority,
     });
     const payload = {
-      format: 'pine-autopilot-training-v10',
+      format: 'pine-autopilot-training-v11',
       exportedAt: new Date().toISOString(),
       stateInputs: STATE_INPUTS,
       cardInputs: CARD_INPUTS,
@@ -2376,6 +2494,8 @@
         lastRollbackAt: model.lastRollbackAt || null,
         immortalPolicyUpdates: model.masteryUpdates,
         immortalSituations: Object.keys(model.masteryPolicy).length,
+        manualTransfersAccepted: model.manualTransfersAccepted,
+        eliteTransfersAccepted: model.eliteTransfersAccepted,
       },
       recentReplay: model.replay.slice(-3000).map(cleanExperience),
       eliteReplay: model.elite.slice(-600).map(cleanExperience),
@@ -2395,7 +2515,7 @@
 
   function downloadMpsCheckpoint() {
     const payload = {
-      format: 'pine-autopilot-checkpoint-v10',
+      format: 'pine-autopilot-checkpoint-v11',
       exportedAt: new Date().toISOString(),
       contract: {
         stateInputs: STATE_INPUTS,
@@ -2427,7 +2547,7 @@
     reader.onload = () => {
       try {
         const payload = JSON.parse(String(reader.result || ''));
-        if (!payload || !['pine-autopilot-checkpoint-v8', 'pine-autopilot-checkpoint-v9', 'pine-autopilot-checkpoint-v10'].includes(payload.format) || !payload.model) throw new Error('format');
+        if (!payload || !['pine-autopilot-checkpoint-v8', 'pine-autopilot-checkpoint-v9', 'pine-autopilot-checkpoint-v10', 'pine-autopilot-checkpoint-v11'].includes(payload.format) || !payload.model) throw new Error('format');
         const incoming = unpackStoredModel(payload.model);
         if (!validHead(incoming) || !validHead(incoming.midHead) || !validHead(incoming.lateHead) || !validHead(incoming.hellHead)) throw new Error('network shape');
         const early = applyHeadSnapshot(model, headSnapshot(incoming));
@@ -2477,7 +2597,7 @@
       return { phase, runs: scores.length, medianSeconds: scores.length ? median(scores) : null };
     });
     return {
-      format: 'pine-autopilot-diagnostics-v10',
+      format: 'pine-autopilot-diagnostics-v11',
       role: learnerRole(),
       workerProfile,
       uniqueExperiences: model.uniqueExperiences,
@@ -2505,6 +2625,8 @@
       immortalSituationsVisible: Object.keys(model.masteryPolicy).length,
       immortalPolicyUpdates: model.masteryUpdates,
       immortalPolicyUses: model.masteryActionUses,
+      manualTransfersAccepted: model.manualTransfersAccepted,
+      eliteTransfersAccepted: model.eliteTransfersAccepted,
       eliteImitationSteps: model.eliteImitationSteps,
       riskStatesVisible: Object.keys(model.riskStats).length,
       riskUpdates: model.riskUpdates,
@@ -2635,7 +2757,7 @@
       : `\nTournament: candidate ${cleanEvaluations.length}/${TOURNAMENT_WINDOW} · champion ${championEvaluations.length}/${TOURNAMENT_WINDOW} clean evals`;
     const migrationText = model.migratedFromV8 ? '\nImported earlier challenger and champion' : '';
     const timingText = run.timingWarnings ? `\nTiming: ${run.largestGameTimeJump.toFixed(1)} s max jump · ${run.timingWarnings} warning(s) · ${run.lowQualityDropped} transition(s) dropped` : '';
-    const top = `Role: ${learnerRole()} · ${workerProfile} worker\nDQN gradient steps: ${experienceCount()}\nUnique shared experiences: ${model.uniqueExperiences}\nEarly ε: ${(explorationRate(model) * 100).toFixed(1)}% · Mid: ${(explorationRate(model.midHead) * 100).toFixed(1)}%\nLate ε: ${(explorationRate(model.lateHead) * 100).toFixed(1)}% · Hell: ${(explorationRate(model.hellHead) * 100).toFixed(1)}%\nReplay: ${model.replay.length}/${REPLAY_LIMIT} · elite: ${model.eliteCount || model.elite.length}/${ELITE_LIMIT} · demos: ${model.demonstrationCount || model.demonstrations.length}/${DEMONSTRATION_LIMIT}\nImmortal policy: ${model.settings.immortalMode ? 'protected' : 'off'} · ${Object.keys(model.masteryPolicy).length} learned situations · used ${model.masteryActionUses} times\nReplay phase mix: E${replayPhaseCounts.early} M${replayPhaseCounts.mid} L${replayPhaseCounts.late} H${replayPhaseCounts.hell}\nAdaptive replay: ${adaptiveReplayBatch}/transition · ${Math.round(DEMONSTRATION_REPLAY_RATE * 100)}% demo target · imitate ${model.eliteImitationSteps}\nRisk shield: ${Object.keys(model.riskStats).length} learned states · ${model.riskUpdates} outcomes\nIdle consolidation: ${model.consolidationSteps} updates / ${model.consolidationPasses} passes\nIntent: ${run.intent} · shield: colour-threat aware\nCandidate held-out: ${cleanEvaluations.length ? formatTime(evaluationMedian) : 'collecting…'} (${cleanEvaluations.length} accepted / ${model.evaluationResults.length} total; ≤${(MAX_EVALUATION_DROPPED_RATE * 100).toFixed(0)}% drops)${tournamentText}${trendText}${championText}${migrationText}${timingText}`;
+    const top = `Role: ${learnerRole()} · ${workerProfile} worker\nDQN gradient steps: ${experienceCount()}\nUnique shared experiences: ${model.uniqueExperiences}\nEarly ε: ${(explorationRate(model) * 100).toFixed(1)}% · Mid: ${(explorationRate(model.midHead) * 100).toFixed(1)}%\nLate ε: ${(explorationRate(model.lateHead) * 100).toFixed(1)}% · Hell: ${(explorationRate(model.hellHead) * 100).toFixed(1)}%\nReplay: ${model.replay.length}/${REPLAY_LIMIT} · elite: ${model.eliteCount || model.elite.length}/${ELITE_LIMIT} · demos: ${model.demonstrationCount || model.demonstrations.length}/${DEMONSTRATION_LIMIT}\nImmortal policy: ${model.settings.immortalMode ? 'protected' : 'off'} · ${Object.keys(model.masteryPolicy).length} learned situations · used ${model.masteryActionUses} times\nDurable transfers: manual ${model.manualTransfersAccepted} · elite ${model.eliteTransfersAccepted}\nReplay phase mix: E${replayPhaseCounts.early} M${replayPhaseCounts.mid} L${replayPhaseCounts.late} H${replayPhaseCounts.hell}\nAdaptive replay: ${adaptiveReplayBatch}/transition · ${Math.round(DEMONSTRATION_REPLAY_RATE * 100)}% demo target · imitate ${model.eliteImitationSteps}\nRisk shield: ${Object.keys(model.riskStats).length} learned states · ${model.riskUpdates} outcomes\nIdle consolidation: ${model.consolidationSteps} updates / ${model.consolidationPasses} passes\nIntent: ${run.intent} · shield: colour-threat aware\nCandidate held-out: ${cleanEvaluations.length ? formatTime(evaluationMedian) : 'collecting…'} (${cleanEvaluations.length} accepted / ${model.evaluationResults.length} total; ≤${(MAX_EVALUATION_DROPPED_RATE * 100).toFixed(0)}% drops)${tournamentText}${trendText}${championText}${migrationText}${timingText}`;
     const learning = panel.querySelector('#learning');
     learning.textContent = top;
     learning.style.whiteSpace = 'pre-line';
