@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Pine Autopilot — Joe Learning Loop
 // @namespace    https://pineandco.online/
-// @version      11.0.0
+// @version      12.0.0
 // @description  Local-only neural-network Joe player for Pine & Co Cocktail Defense.
 // @match        https://pineandco.online/*
 // @homepageURL  https://github.com/changhakim90/pine-autopilot-codex-neural
@@ -24,12 +24,12 @@
   if (window.__pineAutopilotLoaded) return;
   window.__pineAutopilotLoaded = true;
 
-  const VERSION = '11.0.0';
-  // v11 preserves v10's model and makes manual/elite transfers durable when
-  // they originate in an experience-worker tab.
-  const STORE = 'pine-autopilot:joe:neural:v11';
-  const LEGACY_STORE = 'pine-autopilot:joe:neural:v10';
-  const CHANNEL = 'pine-autopilot:neural:v11';
+  const VERSION = '12.0.0';
+  // v12 retains v11's durable transfer path and captures manual key presses
+  // immediately, including short taps that an interval sampler can miss.
+  const STORE = 'pine-autopilot:joe:neural:v12';
+  const LEGACY_STORE = 'pine-autopilot:joe:neural:v11';
+  const CHANNEL = 'pine-autopilot:neural:v12';
   // At 100× game speed, a 55 ms wall-clock poll skips several game seconds.
   // Ten ms keeps the 1.2-second policy horizon meaningful while the page is
   // active, without asking the game for more animation frames.
@@ -78,7 +78,7 @@
   const MASTERY_MAX_BONUS = 0.82;
   const MANUAL_VIDEO_FPS = 12;
   const MANUAL_VIDEO_BITS_PER_SECOND = 1800000;
-  const TRANSFER_OUTBOX_PREFIX = 'pine-autopilot:joe:transfer:v11:';
+  const TRANSFER_OUTBOX_PREFIX = 'pine-autopilot:joe:transfer:v12:';
   const MANUAL_OUTBOX_LIMIT = 180;
   const ELITE_OUTBOX_LIMIT = 4;
   const TRANSFER_ID_LIMIT = 2500;
@@ -238,7 +238,7 @@
     const midHead = createHead(earlyHead);
     const lateHead = createHead(midHead);
     return {
-      version: 11,
+      version: 12,
       completedRuns: 0,
       bestSeconds: 0,
       totalSeconds: 0,
@@ -300,14 +300,14 @@
 
   function loadModel() {
     try {
-      const v11Stored = localStorage.getItem(STORE);
-      const saved = unpackStoredModel(JSON.parse(v11Stored || localStorage.getItem(LEGACY_STORE) || 'null'));
+      const v12Stored = localStorage.getItem(STORE);
+      const saved = unpackStoredModel(JSON.parse(v12Stored || localStorage.getItem(LEGACY_STORE) || 'null'));
       const fresh = blankModel();
       if (!saved || typeof saved !== 'object') return fresh;
       return {
         ...fresh,
         ...saved,
-        version: 11,
+        version: 12,
         migratedFromV8: !!saved.migratedFromV8,
         movementNet: validNetwork(saved.movementNet, MOVE_INPUTS, ACTIONS.length) ? saved.movementNet : fresh.movementNet,
         cardNet: validNetwork(saved.cardNet, CARD_INPUTS, 1) ? saved.cardNet : fresh.cardNet,
@@ -739,6 +739,8 @@
         masteryPolicy: model.masteryPolicy,
         masteryUpdates: model.masteryUpdates,
         masteryActionUses: model.masteryActionUses,
+        manualTransfersAccepted: model.manualTransfersAccepted,
+        eliteTransfersAccepted: model.eliteTransfersAccepted,
         riskStats: model.riskStats,
         riskUpdates: model.riskUpdates,
         eliteImitationSteps: model.eliteImitationSteps,
@@ -808,6 +810,8 @@
           if (incomingModel.masteryPolicy) model.masteryPolicy = normalizeMasteryPolicy(incomingModel.masteryPolicy);
           model.masteryUpdates = Math.max(model.masteryUpdates || 0, Number(incomingModel.masteryUpdates) || 0);
           model.masteryActionUses = Math.max(model.masteryActionUses || 0, Number(incomingModel.masteryActionUses) || 0);
+          model.manualTransfersAccepted = Math.max(model.manualTransfersAccepted || 0, Number(incomingModel.manualTransfersAccepted) || 0);
+          model.eliteTransfersAccepted = Math.max(model.eliteTransfersAccepted || 0, Number(incomingModel.eliteTransfersAccepted) || 0);
           if (incomingModel.riskStats) model.riskStats = normalizeRiskStats(incomingModel.riskStats);
           model.riskUpdates = Math.max(model.riskUpdates || 0, Number(incomingModel.riskUpdates) || 0);
           model.eliteImitationSteps = Math.max(model.eliteImitationSteps || 0, Number(incomingModel.eliteImitationSteps) || 0);
@@ -1253,15 +1257,19 @@
     const key = manualKey(event);
     if (!key || event.repeat) return;
     const now = Date.now();
+    manualDemo.pressed.add(key);
     if (key === ' ') captureManualBurst(ACTIONS.findIndex((action) => action.ultimate));
     else if (now - (manualDemo.keyDownAt[key] || 0) < 280) captureManualBurst(manualDashAction(key));
+    else captureManualDemo();
     manualDemo.keyDownAt[key] = now;
-    manualDemo.pressed.add(key);
   }, true);
   addEventListener('keyup', (event) => {
     if (!manualDemo.active) return;
     const key = manualKey(event);
-    if (key) manualDemo.pressed.delete(key);
+    if (key) {
+      manualDemo.pressed.delete(key);
+      captureManualDemo();
+    }
   }, true);
 
   addEventListener('pointerdown', (event) => {
@@ -2475,7 +2483,7 @@
       priority: experience.priority,
     });
     const payload = {
-      format: 'pine-autopilot-training-v11',
+      format: 'pine-autopilot-training-v12',
       exportedAt: new Date().toISOString(),
       stateInputs: STATE_INPUTS,
       cardInputs: CARD_INPUTS,
@@ -2515,7 +2523,7 @@
 
   function downloadMpsCheckpoint() {
     const payload = {
-      format: 'pine-autopilot-checkpoint-v11',
+      format: 'pine-autopilot-checkpoint-v12',
       exportedAt: new Date().toISOString(),
       contract: {
         stateInputs: STATE_INPUTS,
@@ -2547,7 +2555,7 @@
     reader.onload = () => {
       try {
         const payload = JSON.parse(String(reader.result || ''));
-        if (!payload || !['pine-autopilot-checkpoint-v8', 'pine-autopilot-checkpoint-v9', 'pine-autopilot-checkpoint-v10', 'pine-autopilot-checkpoint-v11'].includes(payload.format) || !payload.model) throw new Error('format');
+        if (!payload || !['pine-autopilot-checkpoint-v8', 'pine-autopilot-checkpoint-v9', 'pine-autopilot-checkpoint-v10', 'pine-autopilot-checkpoint-v11', 'pine-autopilot-checkpoint-v12'].includes(payload.format) || !payload.model) throw new Error('format');
         const incoming = unpackStoredModel(payload.model);
         if (!validHead(incoming) || !validHead(incoming.midHead) || !validHead(incoming.lateHead) || !validHead(incoming.hellHead)) throw new Error('network shape');
         const early = applyHeadSnapshot(model, headSnapshot(incoming));
@@ -2597,7 +2605,7 @@
       return { phase, runs: scores.length, medianSeconds: scores.length ? median(scores) : null };
     });
     return {
-      format: 'pine-autopilot-diagnostics-v11',
+      format: 'pine-autopilot-diagnostics-v12',
       role: learnerRole(),
       workerProfile,
       uniqueExperiences: model.uniqueExperiences,

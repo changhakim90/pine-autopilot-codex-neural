@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""Train a Pine v8/v9/v10/v11 *challenger* locally with PyTorch on Apple Silicon.
+"""Train a Pine v8/v9/v10/v11/v12 *challenger* locally with PyTorch on Apple Silicon.
 
 The browser stays the source of truth: this script only prepares a challenger
-checkpoint. Importing it in Pine Autopilot v11 starts a fresh, blind tournament
+checkpoint. Importing it in Pine Autopilot v12 starts a fresh, blind tournament
 against the browser's frozen champion before the challenger can be promoted.
 Nothing is uploaded or sent to a game server.
 
@@ -133,7 +133,7 @@ def clean_transition(row: dict, state_inputs: int, action_count: int) -> dict | 
 
 def load_transitions(training: dict, state_inputs: int, action_count: int) -> dict[str, list[dict]]:
     by_phase = {phase: [] for phase in PHASES}
-    # Elite trajectories deliberately appear twice: this mirrors v11's 45%
+    # Elite trajectories deliberately appear twice: this mirrors v12's 45%
     # elite sampling while keeping each browser phase head separate.
     rows = (list(training.get("recentReplay") or [])
             + list(training.get("eliteReplay") or []) * 2
@@ -207,9 +207,9 @@ def train_phase(
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Train a Pine Autopilot v11 challenger locally with PyTorch/MPS.")
-    parser.add_argument("checkpoint", type=Path, help="MPS checkpoint downloaded from the v8 through v11 panel")
-    parser.add_argument("training", type=Path, help="training JSON downloaded from the v7 through v11 panel")
+    parser = argparse.ArgumentParser(description="Train a Pine Autopilot v12 challenger locally with PyTorch/MPS.")
+    parser.add_argument("checkpoint", type=Path, help="MPS checkpoint downloaded from the v8 through v12 panel")
+    parser.add_argument("training", type=Path, help="training JSON downloaded from the v7 through v12 panel")
     parser.add_argument("--output", type=Path, default=Path("pine-autopilot-challenger.json"))
     parser.add_argument("--steps", type=int, default=1200, help="total gradient steps across phase heads (default: 1200)")
     parser.add_argument("--batch-size", type=int, default=96)
@@ -225,10 +225,10 @@ def main() -> None:
     torch.manual_seed(args.seed)
     checkpoint = read_json(args.checkpoint)
     training = read_json(args.training)
-    if checkpoint.get("format") not in {"pine-autopilot-checkpoint-v8", "pine-autopilot-checkpoint-v9", "pine-autopilot-checkpoint-v10", "pine-autopilot-checkpoint-v11"} or not isinstance(checkpoint.get("model"), dict):
-        raise SystemExit("Checkpoint must be a Pine Autopilot v8 through v11 file from the browser panel.")
-    if training.get("format") not in {"pine-autopilot-training-v7", "pine-autopilot-training-v8", "pine-autopilot-training-v9", "pine-autopilot-training-v10", "pine-autopilot-training-v11"}:
-        raise SystemExit("Training file must be a Pine Autopilot v7 through v11 export.")
+    if checkpoint.get("format") not in {"pine-autopilot-checkpoint-v8", "pine-autopilot-checkpoint-v9", "pine-autopilot-checkpoint-v10", "pine-autopilot-checkpoint-v11", "pine-autopilot-checkpoint-v12"} or not isinstance(checkpoint.get("model"), dict):
+        raise SystemExit("Checkpoint must be a Pine Autopilot v8 through v12 file from the browser panel.")
+    if training.get("format") not in {"pine-autopilot-training-v7", "pine-autopilot-training-v8", "pine-autopilot-training-v9", "pine-autopilot-training-v10", "pine-autopilot-training-v11", "pine-autopilot-training-v12"}:
+        raise SystemExit("Training file must be a Pine Autopilot v7 through v12 export.")
 
     contract = checkpoint.get("contract") or {}
     state_inputs = int(contract.get("stateInputs", 0))
@@ -285,7 +285,7 @@ def main() -> None:
     }
     args.output.write_text(json.dumps(checkpoint, separators=(",", ":")), encoding="utf-8")
     print(f"Wrote challenger checkpoint: {args.output}")
-    print("Import it through the central v11 Pine tab. It will be tested against the frozen champion before promotion.")
+    print("Import it through the central v12 Pine tab. It will be tested against the frozen champion before promotion.")
 
 
 if __name__ == "__main__":
